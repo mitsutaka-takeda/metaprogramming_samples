@@ -34,53 +34,133 @@
 template<class T> T ntoh(T) = delete; // white list方式。
 uint32_t ntoh(uint32_t v) { return ntohl(v); }
 uint16_t ntoh(uint16_t v) { return ntohs(v); }
-uint8_t ntoh(uint8_t v) { return v; }
-int8_t ntoh(int8_t v) { return v; }
-char ntoh(char v) { return v; }
+uint8_t  ntoh(uint8_t  v) { return v; }
+int8_t   ntoh(int8_t   v) { return v; }
+char     ntoh(char     v) { return v; }
 
 // ホスト・バイトからネットワーク・バイトへの変換。
 template<class T> T hton(T) = delete;
 uint32_t hton(uint32_t v) { return htonl(v); }
 uint16_t hton(uint16_t v) { return htons(v); }
-uint8_t hton(uint8_t v) { return v; }
-int8_t hton(int8_t v) { return v; }
-char hton(char v) { return v; }
+uint8_t  hton(uint8_t  v) { return v; }
+int8_t   hton(int8_t   v) { return v; }
+char     hton(char     v) { return v; }
 // ----------------------------------------------------------------------------
 
+template <typename T>
+auto underlying_type_cast(const T& t) ->
+    typename std::enable_if<std::is_enum<T>::value, typename std::underlying_type<T>::type>::type {
+    return static_cast<typename std::underlying_type<T>::type>(t);
+}
+
+// -------------------------------- Deserialize用 -------------------------------------------------
+// Visitor(reader)パターン。メンバ変数をbufferから読み取った値で埋める。
 struct reader {
-    mutable boost::asio::const_buffer m_buf;
+    mutable boost::asio::const_buffer m_buf; // visitorのoperator()がconstでなければいけないので。
 
     explicit reader(boost::asio::const_buffer buf)
         : m_buf(std::move(buf))
         {}
 
+    // 整数型用(uint32_t等)
     template <typename T>
-    void operator()(T& val) const {
-        // 型Tの各メンバ・フィールドを反復。
+    auto operator()(T& val) const
+        -> typename std::enable_if<std::is_integral<T>::value>::type { // SFINAE(Substitution Failure is Not An Error)
+        val = ntoh(*boost::asio::buffer_cast<const T*>(m_buf)); // 値を読み込む。
+        m_buf = m_buf + sizeof(T);// バッファのポインタを読み込んだ分だけずらす。
+    }
+
+    // enum用。C++11のenum classは整数型へ暗黙の変換はしない。
+    template <typename T>
+    auto operator()(T& val) const
+        -> typename std::enable_if<std::is_enum<T>::value>::type {
+        typename std::underlying_type<T>::type v;
+        (*this)(v); // underlying_type用のoperator()の呼出し。
+        val = static_cast<T>(v);
+    }
+
+    // std::integral_constant用(コンパイル時整数値を表現する型)
+    template <typename T, T v> // テンプレート・パラメータは型以外に値も取れる。
+    void operator()(std::integral_constant<T, v>)// オブジェクトではなく型情報だけなことに注意。用途は解説。
+    {
+        using type = std::integral_constant<T, v>;
+        typename type::value_type val;
+        (*this)(val);
+        if(val != type::value){
+            throw std::runtime_error("unknown value" + std::to_string(val));
+        }
+    }
+
+    // これ以下は可変長のデータ型。
+
+    // 文字列用。
+    void operator()(std::string& s){
+        uint16_t length;// 長さは適当に型を選んで表現。
+        (*this)(length);
+        s = std::string(boost::asio::buffer_cast<const char*>(m_buf), length);
+        m_buf = m_buf + length;
+    }
+
+    // vector用。
+    template <typename T>
+    void operator()(std::vector<T>& vs){
+        const auto length = [this]{
+            uint16_t l;
+            (*this)(l);
+            return l;
+        }(); // Immediately-Invoked Function Expression(Thanks to JavaScript People!)
+
+        vs.reserve(length);
+        for(uint16_t i = 0; i < length; ++i){
+            vs.emplace_back([this]{
+                    T v;
+                    (*this)(v);
+                    return v;
+                }());
+        }
     }
 };
 
+// read関数。
 template <typename T>
-std::pair<T, asio::const_buffer>
-read(asio::const_buffer b){
+std::pair<T, boost::asio::const_buffer>
+read(boost::asio::const_buffer b){
     reader r(std::move(b));
     T res;
-    fusion::for_each(res, r); // 型Tの各メンバ・フィールドを反復。
+    boost::fusion::for_each(res, r); // 型Tの各メンバ・フィールドを反復。静的リフレクション。
     return {res, r.m_buf};
 }
 
+// -------------------------------- Serialize用 -------------------------------------------------
 struct writer {
     mutable boost::asio::mutable_buffer m_buf;
 
-    explicit writer(asio::mutable_buffer buf)
-        : m_buf(std::move(buf))
-        {}
+    explicit writer(boost::asio::mutable_buffer buf) : m_buf(std::move(buf)) {}
 
+    // 整数値用(uint32_t等)
     template <typename T>
-    void operator()(const T& val) const {
+    auto operator()(const T& val) const
+        -> typename std::enable_if<std::is_integral<T>::value>::type {
+        T tmp = hton(val);
+        boost::asio::buffer_copy(m_buf, boost::asio::buffer(&tmp, sizeof(T)));// オブジェクトをバッファ(バイト列)として扱う。
+        m_buf += sizeof(T); // 書き込んだ分だけバッファのポインタをずらす。
+    }
+
+    // enum用。
+    template <typename T>
+    auto operator()(const T& val) const
+        -> typename std::enable_if<std::is_enum<T>::value>::type {
+        (*this)(underlying_type_cast(val));
+    }
+
+    // std::integral_constant用(コンパイル時整数値を表現する型)
+    template <typename T, T v>
+    void operator()(std::integral_constant<T, v>) {
+        (*this)(std::integral_constant<T, v>::value);
     }
 };
 
+// write関数。
 template <typename T>
 boost::asio::mutable_buffer
 write(boost::asio::mutable_buffer b, const T& val){
@@ -88,3 +168,9 @@ write(boost::asio::mutable_buffer b, const T& val){
     boost::fusion::for_each(val, w);
     return w.m_buf;
 }
+
+// ---------------------------------- 直列化可能なユーザ定義型 ----------------------------------
+
+// BOOST_FUSION_DEFINE_STRUCT(
+
+// )

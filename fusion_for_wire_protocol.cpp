@@ -25,9 +25,19 @@
 // ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 // DEALINGS IN THE SOFTWARE.
 
+#include <cassert>
+#include <iostream>
+#include <numeric>
+#include <limits>
+#include <type_traits>
+#include <tuple>
+
 #include <arpa/inet.h>
-#include <boost/asio/buffer.hpp>
-#include <boost/fusion/include/for_each.hpp>
+
+#include "boost/asio/buffer.hpp"
+#include "boost/fusion/include/define_struct.hpp"
+#include "boost/fusion/include/for_each.hpp"
+#include "boost/range/has_range_iterator.hpp"
 
 // ---------------------------------------------------------------------------
 // ネットワーク・バイトからホスト・バイトへの変換。
@@ -81,8 +91,7 @@ struct reader {
 
     // std::integral_constant用(コンパイル時整数値を表現する型)
     template <typename T, T v> // テンプレート・パラメータは型以外に値も取れる。
-    void operator()(std::integral_constant<T, v>)// オブジェクトではなく型情報だけなことに注意。用途は解説。
-    {
+    void operator()(std::integral_constant<T, v>) const { // オブジェクトではなく型情報だけなことに注意。用途は解説。
         using type = std::integral_constant<T, v>;
         typename type::value_type val;
         (*this)(val);
@@ -94,7 +103,7 @@ struct reader {
     // これ以下は可変長のデータ型。
 
     // 文字列用。
-    void operator()(std::string& s){
+    void operator()(std::string& s) const {
         uint16_t length;// 長さは適当に型を選んで表現。
         (*this)(length);
         s = std::string(boost::asio::buffer_cast<const char*>(m_buf), length);
@@ -103,7 +112,7 @@ struct reader {
 
     // vector用。
     template <typename T>
-    void operator()(std::vector<T>& vs){
+    void operator()(std::vector<T>& vs) const {
         const auto length = [this]{
             uint16_t l;
             (*this)(l);
@@ -118,6 +127,13 @@ struct reader {
                     return v;
                 }());
         }
+    }
+
+    // Fusionで定義されたユーザ定義型用。ユーザ定義を入れ子にできる。
+    template<class T>
+    auto operator()(T & val) const
+        -> typename std::enable_if<boost::fusion::traits::is_sequence<T>::value>::type {
+        boost::fusion::for_each(val, *this);
     }
 };
 
@@ -143,7 +159,7 @@ struct writer {
         -> typename std::enable_if<std::is_integral<T>::value>::type {
         T tmp = hton(val);
         boost::asio::buffer_copy(m_buf, boost::asio::buffer(&tmp, sizeof(T)));// オブジェクトをバッファ(バイト列)として扱う。
-        m_buf += sizeof(T); // 書き込んだ分だけバッファのポインタをずらす。
+        m_buf = m_buf + sizeof(T); // 書き込んだ分だけバッファのポインタをずらす。
     }
 
     // enum用。
@@ -155,8 +171,34 @@ struct writer {
 
     // std::integral_constant用(コンパイル時整数値を表現する型)
     template <typename T, T v>
-    void operator()(std::integral_constant<T, v>) {
+    void operator()(std::integral_constant<T, v>) const {
         (*this)(std::integral_constant<T, v>::value);
+    }
+
+    // Conceptを利用して広い範囲のクラスを対象とした関数を定義する。
+    // Conceptとは、アルゴリズムに必要なシンタックスとシマンテックスを定義するための機構。
+    // 特定の型TがConceptを満す場合、その型はConceptをモデルするという。
+    // 以下の関数テンプレートで、Concept ForwardRangeをモデルする型ならシリアライズできる。
+    // ForwardRangeをモデルする型の例: std::string、std::vector、etc。
+    template <typename T>
+    auto operator()(const T& vs) const
+        -> typename std::enable_if<boost::has_range_const_iterator<T>::value>::type { // Concept: ForwardRange
+        const auto length = std::distance(std::begin(vs), std::end(vs));
+        if(length > std::numeric_limits<uint16_t>::max()) {
+            throw std::runtime_error("length exceeds the range of uint16_t");
+        }
+
+        (*this)(static_cast<uint16_t>(length));
+        for(const auto& v : vs){
+            (*this)(v);
+        }
+    }
+
+    // Fusionで定義されたユーザ定義型用。ユーザ定義を入れ子にできる。
+    template<class T>
+    auto operator()(T const& val) const ->
+        typename std::enable_if<boost::fusion::traits::is_sequence<T>::value>::type {
+        boost::fusion::for_each(val, *this);
     }
 };
 
@@ -170,13 +212,175 @@ write(boost::asio::mutable_buffer b, const T& val){
 }
 
 // ---------------------------------- 直列化可能なユーザ定義型 ----------------------------------
+// What we have achived?
+// ここまで空行+コメント含めて184行。関数定義の平均は数行。
+// 以下のようなユーザ定義型をシリアライズ・デシリアライズする能力。
+//  - 整数型
+//  - コンパイル時定数型
+//  - 列挙型
+//  - 文字列
+//  - 可変長配列
+//  - 上に列挙した型、または他のユーザ定義型のメンバ変数を持つユーザ定義型。
 
 // マジック・バイトやバージョンは型で表現すれば良い!
-using magic_byte_t = std::integral_constant<uint8_t, 0x20>;
-using version_t    = std::integral_constant<uint8_t, 0x01>;
+namespace myapp{
+    using magic_byte_t = std::integral_constant<uint32_t, 0x20>; // 1byteじゃないとダメなことに注意。
+    using version_t    = std::integral_constant<uint32_t, 0x01>;
+
+    enum class message_type : uint16_t {
+        command,
+        data,
+    };
+
+    enum class command_type : uint8_t {
+        command_1,
+        command_2,
+    };
+};
+
+// struct myapp::headerの定義。
 BOOST_FUSION_DEFINE_STRUCT(
     (myapp), // 名前空間。
-    CommandTypeA, // ユーザ定義型の名前
-    ()
-
+    header, // ユーザ定義型の名前
+    (myapp::magic_byte_t, magic_byte) // マジック・バイトを表現するassociated type。(メンバ変数じゃないよ!)
+    (myapp::version_t, version) // バージョンを表現するassociated type。
+    (uint16_t, length)
+    (myapp::message_type, message_type)
     )
+
+BOOST_FUSION_DEFINE_STRUCT(
+    (myapp),
+    command,
+    (myapp::command_type, command_type)
+    (std::vector<std::string>, args))
+
+BOOST_FUSION_DEFINE_STRUCT(
+    (myapp),
+    data,
+    (std::vector<char>, bytes)
+    )
+
+namespace myapp {// コンソール出力用関数。
+
+    template <typename T, T v>
+    std::ostream&
+    operator<<(std::ostream& o, std::integral_constant<T, v>) {
+        o << std::to_string(v);
+        return o;
+    }
+
+    template <typename T>
+    std::ostream&
+    operator<<(std::ostream& o, const std::vector<T>& vs) {
+        for(const auto& v: vs){
+            o << v << ", ";
+        }
+        return o;
+    }
+
+    std::ostream&
+    operator<<(std::ostream& o, const myapp::message_type& t){
+        o << "message_type : ";
+        switch(t){
+        case myapp::message_type::command:
+            o << "command";
+            break;
+        case myapp::message_type::data:
+            o << "data";
+            break;
+        default:
+            assert(false);
+        }
+        return o;
+    }
+
+    std::ostream&
+    operator<<(std::ostream& o, const myapp::header& h){
+        o << "magic_byte   : " << h.magic_byte << "\n";
+        o << "version      : " << h.version    << "\n";
+        o << "length       : " << h.length     << "\n";
+        o << h.message_type;
+        return o;
+    }
+
+    std::ostream&
+    operator<<(std::ostream& o, const myapp::command_type& ct) {
+        o << "command_type : ";
+        switch(ct){
+        case myapp::command_type::command_1:
+            o << "command_1";
+            break;
+        case myapp::command_type::command_2:
+            o << "command_2";
+            break;
+        default:
+            assert(false);
+        }
+        return o;
+    }
+
+    std::ostream&
+    operator<<(std::ostream& o, const myapp::command& c){
+        o << c.command_type << "\n";
+        o << c.args;
+        return o;
+    }
+
+}
+
+int main() {
+    // 通信のシミュレーション
+    std::array<char, 128> buf;
+
+    { // 送信側
+        myapp::header h;
+        auto rest = write<myapp::header>(boost::asio::buffer(buf), h); // 固定長ヘッダ分だけ書き込み開始位置をずらす(ボディの長さが未定なため)。
+
+        // 送信するコマンド。
+        const auto com = []{
+            myapp::command c;
+            c.command_type = myapp::command_type::command_1;
+            c.args.push_back("target 1");
+            c.args.push_back("target 2");
+            return c;
+        }();
+        rest = write<myapp::command>(rest, com); // シリアライズしてバッファに書き込む。
+
+        h = [&buf, &rest]{
+            myapp::header h;
+            h.length = buf.size() - boost::asio::buffer_size(rest);
+            h.message_type = myapp::message_type::command;
+            return h;
+        }();
+        (void) write<myapp::header>(boost::asio::buffer(buf), h);
+    }
+    { // 受信側
+        myapp::header h;
+        boost::asio::const_buffer rest;
+        std::tie(h, rest) = read<myapp::header>(boost::asio::buffer(buf));
+
+        std::cout << "sizeof(h) : " << sizeof(h) << " bytes\n";
+        std::cout << "Recieved header is\n";
+        std::cout << h << "\n";
+
+        myapp::command c;
+        std::tie(c, rest) = read<myapp::command>(rest);
+        std::cout <<"Recieved command is\n";
+        std::cout << c << "\n";
+
+        // ------------------- 実行結果 -------------------
+        // sizeof(h) : 6 bytes
+        // Recieved header is
+        // magic_byte   : 32
+        // version      : 1
+        // length       : 35
+        // message_type : command
+        // Recieved command is
+        // command_type : command_1
+        // target 1, target 2,
+
+        // ------------------- 質問 -----------------------
+        // Q1. sizeof(h)が6 bytesなのは何故？
+    }
+    return 0;
+}

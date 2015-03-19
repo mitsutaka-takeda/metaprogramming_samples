@@ -28,7 +28,7 @@ operator+(Quantity<U> l, Quantity<U> r) {// 同じ単位Uを持つ量しか足�
 template <typename U1, typename U2>
 auto
 operator*(Quantity<U1> l, Quantity<U2> r) {// 違う単位U1,U2の量でもかけ算はできる。
-    return Quantity<typename UnitPlus<U1, U2>::type>{l.val+r.val};
+    return Quantity<typename UnitPlus<U1, U2>::type>{l.val*r.val};
 }
 
 int main()

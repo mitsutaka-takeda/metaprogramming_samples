@@ -171,6 +171,12 @@ write(boost::asio::mutable_buffer b, const T& val){
 
 // ---------------------------------- 直列化可能なユーザ定義型 ----------------------------------
 
-// BOOST_FUSION_DEFINE_STRUCT(
+// マジック・バイトやバージョンは型で表現すれば良い!
+using magic_byte_t = std::integral_constant<uint8_t, 0x20>;
+using version_t    = std::integral_constant<uint8_t, 0x01>;
+BOOST_FUSION_DEFINE_STRUCT(
+    (myapp), // 名前空間。
+    CommandTypeA, // ユーザ定義型の名前
+    ()
 
-// )
+    )

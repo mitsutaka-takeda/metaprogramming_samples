@@ -26,8 +26,13 @@
 // DEALINGS IN THE SOFTWARE.
 
 #include <arpa/inet.h>
-#include <boost/asio/buffer.hpp>
-#include <boost/fusion/include/for_each.hpp>
+#include <limits>
+#include <type_traits>
+
+#include "boost/asio/buffer.hpp"
+#include "boost/fusion/include/define_struct.hpp"
+#include "boost/fusion/include/for_each.hpp"
+#include "boost/range/has_range_iterator.hpp"
 
 // ---------------------------------------------------------------------------
 // ネットワーク・バイトからホスト・バイトへの変換。
@@ -158,6 +163,20 @@ struct writer {
     void operator()(std::integral_constant<T, v>) {
         (*this)(std::integral_constant<T, v>::value);
     }
+
+    template <typename T>
+    auto operator()(const T& vs) const
+        -> typename std::enable_if<boost::has_range_const_iterator<T>::value>::type { // Concept: ForwardRange
+        const auto length = std::distance(std::begin(vs), std::end(vs));
+        if(length > std::numeric_limits<uint16_t>::max()) {
+            throw std::runtime_error("length exceeds the range of uint16_t");
+        }
+
+        (*this)(static_cast<uint16_t>(length));
+        for(const auto& v : vs){
+            (*this)(v);
+        }
+    }
 };
 
 // write関数。
@@ -172,11 +191,19 @@ write(boost::asio::mutable_buffer b, const T& val){
 // ---------------------------------- 直列化可能なユーザ定義型 ----------------------------------
 
 // マジック・バイトやバージョンは型で表現すれば良い!
-using magic_byte_t = std::integral_constant<uint8_t, 0x20>;
-using version_t    = std::integral_constant<uint8_t, 0x01>;
+namespace myapp{
+    using magic_byte_t = std::integral_constant<uint8_t, 0x20>;
+    using version_t    = std::integral_constant<uint8_t, 0x01>;
+};
+
 BOOST_FUSION_DEFINE_STRUCT(
     (myapp), // 名前空間。
-    CommandTypeA, // ユーザ定義型の名前
-    ()
-
+    header, // ユーザ定義型の名前
+    (myapp::magic_byte_t, magit_byte)
     )
+
+int main()
+{
+
+    return 0;
+}
